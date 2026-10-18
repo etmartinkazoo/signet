@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Signet
+GenericName=Calendar
+Comment=A calendar that shares its accounts with Sealwax
+Exec=signet
+Icon=office-calendar
+Terminal=false
+Categories=Office;Calendar;GTK;
+Keywords=calendar;events;caldav;
+StartupNotify=true
+StartupWMClass=io.brem.Signet
