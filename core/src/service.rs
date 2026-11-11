@@ -2,7 +2,7 @@
 //! an event to its server (or to the local calendar) before the store shows it.
 
 use crate::accounts::{self, Account, Auth, Config};
-use crate::caldav::{self, Client, Condition, Credentials, RemoteCalendar};
+use crate::caldav::{self, Client, Condition, Credentials, Location, RemoteCalendar};
 use crate::google;
 use crate::store::{Calendar, Store, StoredResource};
 use chrono::{DateTime, Duration, Utc};
@@ -22,12 +22,26 @@ pub struct Problem {
     pub message: String,
     /// The account key when signing in (with Google) would fix it.
     pub sign_in: Option<String>,
+    /// A calendar server found for the account, which the user is asked about before the
+    /// account's password goes to it.
+    pub approve: Option<Approval>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Approval {
+    pub key: String,
+    /// Where discovery would begin.
+    pub server: String,
+    /// The server's name, to show.
+    pub host: String,
 }
 
 /// Why an account couldn't be refreshed.
+#[derive(Clone)]
 enum Failure {
     Message(String),
     SignIn(String),
+    Approve(Url),
 }
 
 impl From<String> for Failure {
@@ -42,6 +56,9 @@ pub struct Service {
     pub local: Tz,
     accounts: Mutex<Vec<Account>>,
     clients: tokio::sync::Mutex<HashMap<String, Arc<Client>>>,
+    /// Discovery that didn't find a calendar home, by account, with the account's settings it
+    /// ran with: not tried again until those change or the user asks to refresh.
+    failed: Mutex<HashMap<String, (String, Failure)>>,
 }
 
 impl Service {
@@ -71,6 +88,7 @@ impl Service {
             local: crate::event::local_zone(),
             accounts: Mutex::new(Vec::new()),
             clients: tokio::sync::Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -119,7 +137,7 @@ impl Service {
         let list = match found {
             Ok(list) => list,
             Err(message) => {
-                problems.push(Problem { account: "Sealwax accounts".to_owned(), message, sign_in: None });
+                problems.push(Problem { account: "Sealwax accounts".to_owned(), message, sign_in: None, approve: None });
                 self.accounts()
             }
         };
@@ -140,10 +158,21 @@ impl Service {
         while let Some(done) = tasks.join_next().await {
             match done {
                 Ok((account, Err(Failure::Message(message)))) => {
-                    problems.push(Problem { account: account.label, message, sign_in: None });
+                    problems.push(Problem { account: account.label, message, sign_in: None, approve: None });
                 }
                 Ok((account, Err(Failure::SignIn(message)))) => {
-                    problems.push(Problem { account: account.label, message, sign_in: Some(account.key) });
+                    problems.push(Problem { account: account.label, message, sign_in: Some(account.key), approve: None });
+                }
+                Ok((account, Err(Failure::Approve(server)))) => {
+                    let host = server.host_str().unwrap_or_default().to_owned();
+                    let message = format!(
+                        "Looking up the calendar server for {} led to {host}. To show this account's \
+                         calendars, Signet would sign in there with the password Sealwax keeps for it.\n\n\
+                         Allow this only if {host} is where your calendars are.",
+                        account.address
+                    );
+                    let approve = Approval { key: account.key, server: server.to_string(), host };
+                    problems.push(Problem { account: account.label, message, sign_in: None, approve: Some(approve) });
                 }
                 _ => {}
             }
@@ -151,7 +180,40 @@ impl Service {
         problems
     }
 
+    /// Tries discovery again for accounts where it failed: for Refresh.
+    pub fn retry_discovery(&self) {
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// Records whether the account's password may go to a server discovery found.
+    pub fn decide(&self, approval: &Approval, allowed: bool) -> Result<(), String> {
+        let server = Url::parse(&approval.server).map_err(|e| e.to_string())?;
+        self.store
+            .decide_server(&approval.key, &server.origin().ascii_serialization(), allowed, server.as_str())
+            .map_err(|e| e.to_string())?;
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).remove(&approval.key);
+        Ok(())
+    }
+
+    /// The account's client, trusting the servers its credentials may go to.
     async fn client(&self, account: &Account) -> Result<Arc<Client>, String> {
+        let client = self.new_or_kept_client(account).await?;
+        if account.is_google() {
+            client.trust(&Url::parse(google::CALDAV_ROOT).expect("a valid URL"));
+        } else if let Ok(Location::Server(url)) =
+            caldav::locate(&account.address, account.mail_host.as_deref(), account.caldav.as_deref())
+        {
+            client.trust(&url);
+        }
+        for server in self.store.servers(&account.key).map_err(|e| e.to_string())? {
+            if let Some(url) = server.allowed.then(|| Url::parse(&server.origin).ok()).flatten() {
+                client.trust(&url);
+            }
+        }
+        Ok(client)
+    }
+
+    async fn new_or_kept_client(&self, account: &Account) -> Result<Arc<Client>, String> {
         let mut clients = self.clients.lock().await;
         if let Some(client) = clients.get(&account.key) {
             return Ok(Arc::clone(client));
@@ -175,35 +237,76 @@ impl Service {
         Ok(client)
     }
 
-    /// The calendar home: the one found before, else found now and kept.
-    async fn home(&self, account: &Account, client: &Client) -> Result<Url, String> {
-        if let Some(home) = self.store.home(&account.key).ok().flatten().and_then(|h| Url::parse(&h).ok()) {
+    /// The calendar home: the one found before, if its server is trusted, else found now and
+    /// kept. A failure is remembered rather than tried again at every refresh.
+    async fn home(&self, account: &Account, client: &Client) -> Result<Url, Failure> {
+        if let Some(home) = self.store.home(&account.key).ok().flatten().and_then(|h| Url::parse(&h).ok())
+            && client.trusts(&home)
+        {
             return Ok(home);
         }
-        let candidates = caldav::candidates(&account.address, account.mail_host.as_deref(), account.caldav.as_deref())
-            .map_err(|error| error.to_string())?;
-        let mut last = caldav::Error::NoServer;
-        for start in candidates {
-            match client.discover(&start).await {
-                Ok(home) => {
-                    let _ = self.store.set_home(&account.key, Some(home.as_str()));
-                    return Ok(home);
-                }
-                Err(caldav::Error::Unauthorized) => return Err(unauthorized()),
-                Err(error) => {
-                    tracing::debug!("no CalDAV at {start}: {error}");
-                    last = error;
-                }
+        let settings = format!("{}\n{}\n{:?}\n{:?}", account.address, account.username, account.mail_host, account.caldav);
+        if let Some((tried, failure)) = self.failed.lock().unwrap_or_else(|p| p.into_inner()).get(&account.key)
+            && *tried == settings
+        {
+            return Err(failure.clone());
+        }
+        let found = self.discover(account, client).await;
+        let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        match &found {
+            Ok(home) => {
+                failed.remove(&account.key);
+                let _ = self.store.set_home(&account.key, Some(home.as_str()));
+                let _ = self.store.allow_named_server(&account.key, &home.origin().ascii_serialization());
+            }
+            Err(failure) => {
+                failed.insert(account.key.clone(), (settings, failure.clone()));
             }
         }
-        Err(match last {
-            caldav::Error::NotFound | caldav::Error::Status(_) | caldav::Error::Network(_) => {
-                "no calendar server was found; set its address as caldav = \"https://…\" under \
-                 [account.<key>] in ~/.config/signet/config.toml"
-                    .to_owned()
+        found
+    }
+
+    async fn discover(&self, account: &Account, client: &Client) -> Result<Url, Failure> {
+        let location = caldav::locate(&account.address, account.mail_host.as_deref(), account.caldav.as_deref())
+            .map_err(|error| error.to_string())?;
+        let start = match location {
+            Location::Server(url) => url,
+            Location::Domain(domain) => {
+                let servers = self.store.servers(&account.key).map_err(|e| e.to_string())?;
+                let allowed = servers
+                    .iter()
+                    .filter(|server| server.allowed)
+                    .find_map(|server| server.start.as_deref().and_then(|start| Url::parse(start).ok()));
+                match allowed {
+                    Some(start) => start,
+                    None => {
+                        let found = client.probe(&domain).await.map_err(|error| {
+                            tracing::debug!("no CalDAV for {domain}: {error}");
+                            not_found()
+                        })?;
+                        let origin = found.origin().ascii_serialization();
+                        if servers.iter().any(|server| server.origin == origin && !server.allowed) {
+                            return Err(format!(
+                                "you chose not to use {} for this account's calendars; {}",
+                                found.host_str().unwrap_or_default(),
+                                SET_CALDAV
+                            )
+                            .into());
+                        }
+                        return Err(Failure::Approve(found));
+                    }
+                }
             }
-            other => other.to_string(),
-        })
+        };
+        match client.discover(&start).await {
+            Ok(home) => Ok(home),
+            Err(caldav::Error::Unauthorized) => Err(unauthorized().into()),
+            Err(error @ (caldav::Error::NotFound | caldav::Error::Status(_) | caldav::Error::Network(_))) => {
+                tracing::debug!("no CalDAV at {start}: {error}");
+                Err(not_found().into())
+            }
+            Err(error) => Err(error.to_string().into()),
+        }
     }
 
     async fn refresh_account(&self, account: &Account, around: DateTime<Utc>) -> Result<(), Failure> {
@@ -403,6 +506,13 @@ impl Service {
         }
         self.store.delete_resource(resource).map_err(|e| e.to_string())
     }
+}
+
+const SET_CALDAV: &str =
+    "set its address as caldav = \"https://…\" under [account.<key>] in ~/.config/signet/config.toml";
+
+fn not_found() -> String {
+    format!("no calendar server was found; {SET_CALDAV}")
 }
 
 fn unauthorized() -> String {

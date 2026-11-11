@@ -2065,6 +2065,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "url",

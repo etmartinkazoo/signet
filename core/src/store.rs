@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS resource (
     ics TEXT NOT NULL,
     UNIQUE (calendar, url)
 );
+-- Calendar servers an account's password may go to, beyond its configured or known one: those
+-- the user allowed (start is where discovery begins) or declined, and the servers those named
+-- for their calendars.
+CREATE TABLE IF NOT EXISTS server (
+    account TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    allowed INTEGER NOT NULL,
+    start TEXT,
+    PRIMARY KEY (account, origin)
+);
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +78,16 @@ pub struct StoredResource {
     pub url: String,
     pub etag: Option<String>,
     pub ics: String,
+}
+
+/// A calendar server the user decided about, or one an allowed server named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Server {
+    /// `https://host[:port]`.
+    pub origin: String,
+    pub allowed: bool,
+    /// Where discovery begins, for a server the user was asked about.
+    pub start: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +175,34 @@ impl Store {
         Ok(())
     }
 
+    pub fn servers(&self, account: &str) -> Result<Vec<Server>, StoreError> {
+        let db = self.db();
+        let mut statement = db.prepare("SELECT origin, allowed, start FROM server WHERE account = ?1 ORDER BY origin")?;
+        let rows = statement.query_map([account], |row| {
+            Ok(Server { origin: row.get(0)?, allowed: row.get(1)?, start: row.get(2)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records the user's answer about a server, found by looking from `start`.
+    pub fn decide_server(&self, account: &str, origin: &str, allowed: bool, start: &str) -> Result<(), StoreError> {
+        self.db().execute(
+            "INSERT INTO server (account, origin, allowed, start) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account, origin) DO UPDATE SET allowed = excluded.allowed, start = excluded.start",
+            params![account, origin, allowed, start],
+        )?;
+        Ok(())
+    }
+
+    /// Allows a server that an allowed one named (its calendar home), unless the user declined it.
+    pub fn allow_named_server(&self, account: &str, origin: &str) -> Result<(), StoreError> {
+        self.db().execute(
+            "INSERT OR IGNORE INTO server (account, origin, allowed, start) VALUES (?1, ?2, 1, NULL)",
+            params![account, origin],
+        )?;
+        Ok(())
+    }
+
     /// Adds a server's calendar or refreshes its name, colour and access; keeps whether it's shown.
     pub fn upsert_calendar(
         &self,
@@ -201,6 +249,11 @@ impl Store {
         for account in accounts.into_iter().filter(|account| !keep.contains(account)) {
             db.execute("DELETE FROM calendar WHERE account = ?1", [&account])?;
             db.execute("DELETE FROM account WHERE key = ?1", [&account])?;
+        }
+        let mut statement = db.prepare("SELECT DISTINCT account FROM server")?;
+        let accounts: Vec<String> = statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        for account in accounts.into_iter().filter(|account| !keep.contains(account)) {
+            db.execute("DELETE FROM server WHERE account = ?1", [&account])?;
         }
         Ok(())
     }
@@ -314,7 +367,18 @@ mod tests {
         store.set_home("work", Some("https://dav/")).unwrap();
         assert_eq!(store.home("work").unwrap().as_deref(), Some("https://dav/"));
         store.upsert_calendar("gone", "https://x/", "X", None, false).unwrap();
+        store.decide_server("work", "https://dav.example", true, "https://dav.example/dav/").unwrap();
+        store.allow_named_server("work", "https://dav.example").unwrap();
+        store.decide_server("work", "https://evil.example", false, "https://evil.example/").unwrap();
+        store.allow_named_server("work", "https://evil.example").unwrap();
+        store.decide_server("gone", "https://x", true, "https://x/").unwrap();
+        let servers = store.servers("work").unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(servers[0].allowed && servers[0].start.as_deref() == Some("https://dav.example/dav/"));
+        assert!(!servers[1].allowed, "naming a declined server doesn't allow it");
         store.retain_accounts(&["work".to_owned()]).unwrap();
         assert_eq!(store.calendars().unwrap().len(), 1);
+        assert!(store.servers("gone").unwrap().is_empty());
+        assert_eq!(store.servers("work").unwrap().len(), 2);
     }
 }

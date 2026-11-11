@@ -17,7 +17,9 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("usage: caldav_live URL USER PASSWORD");
     };
     let client = Client::new(Credentials::Password { username: user.clone(), password: Zeroizing::new(password.clone()) })?;
-    let home = client.discover(&url.parse()?).await?;
+    let url = url.parse()?;
+    client.trust(&url);
+    let home = client.discover(&url).await?;
     println!("home: {home}");
     let calendars = client.calendars(&home).await?;
     for calendar in &calendars {

@@ -1,10 +1,16 @@
 //! CalDAV (RFC 4791) over HTTPS: finding an account's calendars (RFC 6764 and a provider list),
 //! reading the events of a range of days, and writing one event at a time with ETags, so an
 //! edit never overwrites a change made elsewhere in the meantime.
+//!
+//! The password is often the account's mail password, so it goes only to servers the account
+//! trusts: the configured or known one, or one the user allowed. It's sent once such a server
+//! asks for it, never to a server a redirect names unless that server is trusted too.
 
 use chrono::{DateTime, Utc};
 use reqwest::{Method, StatusCode, header};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 use zeroize::Zeroizing;
@@ -36,6 +42,9 @@ pub enum Error {
     NoServer,
     #[error("{0}")]
     Unsupported(&'static str),
+    /// A trusted server sent the request on to one that isn't, or a calendar is on one.
+    #[error("Signet won't send this account's password to {0}, which isn't its calendar server")]
+    Elsewhere(String),
 }
 
 /// A calendar collection on the server.
@@ -79,15 +88,24 @@ pub enum Credentials {
 pub struct Client {
     http: reqwest::Client,
     credentials: Credentials,
+    /// The origins the credentials may go to.
+    trusted: Mutex<HashSet<url::Origin>>,
+    /// Trusted origins that asked for Basic authentication, so the password goes with every
+    /// request to them from now on.
+    challenged: Mutex<HashSet<url::Origin>>,
 }
 
 /// The HTTP client every request goes through: rustls with the system's certificates, no
 /// redirects followed on its own (`send` follows them), and a 30 s limit.
 pub fn http_client() -> Result<reqwest::Client, String> {
+    build_http(None)
+}
+
+fn build_http(roots: Option<&Path>) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(concat!("Signet/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
-        .tls_backend_preconfigured(tls_config().map_err(|error| error.to_string())?)
+        .tls_backend_preconfigured(tls_config(roots).map_err(|error| error.to_string())?)
         .connect_timeout(TIMEOUT)
         .timeout(TIMEOUT)
         .build()
@@ -100,11 +118,38 @@ pub fn describe(error: &reqwest::Error) -> String {
 }
 
 impl Client {
+    /// A client that trusts no server yet: see [`Client::trust`].
     pub fn new(credentials: Credentials) -> Result<Self, Error> {
+        Self::with_http(http_client().map_err(Error::Network)?, credentials)
+    }
+
+    /// A client that trusts only the certificates in a PEM file: for tests.
+    pub fn with_roots(credentials: Credentials, roots: &Path) -> Result<Self, Error> {
+        Self::with_http(build_http(Some(roots)).map_err(Error::Network)?, credentials)
+    }
+
+    fn with_http(http: reqwest::Client, credentials: Credentials) -> Result<Self, Error> {
         Ok(Self {
-            http: http_client().map_err(Error::Network)?,
+            http,
             credentials,
+            trusted: Mutex::new(HashSet::new()),
+            challenged: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Lets the credentials go to `url`'s origin (scheme, host and port).
+    pub fn trust(&self, url: &Url) {
+        if url.scheme() == "https" {
+            lock(&self.trusted).insert(url.origin());
+        }
+    }
+
+    pub fn trusts(&self, url: &Url) -> bool {
+        lock(&self.trusted).contains(&url.origin())
+    }
+
+    fn challenged(&self, url: &Url) -> bool {
+        lock(&self.challenged).contains(&url.origin())
     }
 
     /// The Google tokens behind this client, when it signs in with Google.
@@ -115,8 +160,7 @@ impl Client {
         }
     }
 
-    /// Sends a request, following redirects with the same method and body (a PROPFIND to
-    /// `/.well-known/caldav` is answered with one). Credentials go only over HTTPS.
+    /// Sends a request with the account's credentials and reads the answer's status.
     async fn send(
         &self,
         method: Method,
@@ -125,22 +169,59 @@ impl Client {
         body: Option<String>,
         extra: &[(header::HeaderName, String)],
     ) -> Result<(Url, reqwest::Response), Error> {
+        let (url, response) = self.fetch(method, url, depth, body, extra, true).await?;
+        match response.status() {
+            StatusCode::UNAUTHORIZED if !self.trusts(&url) => Err(Error::Elsewhere(host_of(&url))),
+            StatusCode::UNAUTHORIZED
+                if matches!(self.credentials, Credentials::Password { .. }) && !self.challenged(&url) =>
+            {
+                Err(Error::Unsupported("the calendar server asks for a kind of sign-in Signet doesn't support"))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Unauthorized),
+            StatusCode::NOT_FOUND => Err(Error::NotFound),
+            StatusCode::PRECONDITION_FAILED => Err(Error::Changed),
+            status if status.is_success() => Ok((url, response)),
+            status => Err(Error::Status(status)),
+        }
+    }
+
+    /// Sends a request, following redirects with the same method and body (a PROPFIND to
+    /// `/.well-known/caldav` is answered with one), and returns the last answer whatever its
+    /// status. With `authenticate`, credentials go to trusted origins only: the password once
+    /// the server asks for it with a Basic challenge, Google's token up front. A redirect from a
+    /// trusted origin to one that isn't trusted is refused, not followed.
+    async fn fetch(
+        &self,
+        method: Method,
+        url: &Url,
+        depth: Option<&str>,
+        body: Option<String>,
+        extra: &[(header::HeaderName, String)],
+        authenticate: bool,
+    ) -> Result<(Url, reqwest::Response), Error> {
         let mut url = url.clone();
-        for _ in 0..=MAX_REDIRECTS {
+        let mut redirects = 0;
+        loop {
             if url.scheme() != "https" {
                 return Err(Error::Unsupported("the calendar server must use HTTPS"));
             }
+            let trusted = authenticate && self.trusts(&url);
             let mut request = self.http.request(method.clone(), url.clone());
-            request = match &self.credentials {
-                Credentials::Password { username, password } => request.basic_auth(username, Some(password.as_str())),
-                Credentials::Google(tokens) => {
-                    let token = tokens.access().await.map_err(|error| match error {
-                        crate::google::Error::SignInNeeded => Error::SignIn,
-                        other => Error::Network(other.to_string()),
-                    })?;
-                    request.bearer_auth(token.as_str())
-                }
-            };
+            if trusted {
+                request = match &self.credentials {
+                    Credentials::Password { username, password } if self.challenged(&url) => {
+                        request.basic_auth(username, Some(password.as_str()))
+                    }
+                    Credentials::Password { .. } => request,
+                    Credentials::Google(tokens) => {
+                        let token = tokens.access().await.map_err(|error| match error {
+                            crate::google::Error::SignInNeeded => Error::SignIn,
+                            other => Error::Network(other.to_string()),
+                        })?;
+                        request.bearer_auth(token.as_str())
+                    }
+                };
+            }
             if let Some(depth) = depth {
                 request = request.header("Depth", depth);
             }
@@ -152,25 +233,49 @@ impl Client {
                 request = request.header(header::CONTENT_TYPE, kind).body(body.clone());
             }
             let response = request.send().await.map_err(|error| Error::Network(describe(&error)))?;
+            if trusted
+                && response.status() == StatusCode::UNAUTHORIZED
+                && matches!(self.credentials, Credentials::Password { .. })
+                && !self.challenged(&url)
+                && asks_for_basic(&response)
+            {
+                lock(&self.challenged).insert(url.origin());
+                continue;
+            }
             if response.status().is_redirection() {
-                let location = response
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(Error::Network("too many redirects".to_owned()));
+                }
+                let next = response
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|location| url.join(location).ok())
                     .ok_or(Error::Answer)?;
-                url = location;
+                if trusted && next.origin() != url.origin() && !self.trusts(&next) {
+                    return Err(Error::Elsewhere(host_of(&next)));
+                }
+                url = next;
                 continue;
             }
-            return match response.status() {
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Unauthorized),
-                StatusCode::NOT_FOUND => Err(Error::NotFound),
-                StatusCode::PRECONDITION_FAILED => Err(Error::Changed),
-                status if status.is_success() => Ok((url, response)),
-                status => Err(Error::Status(status)),
-            };
+            return Ok((url, response));
         }
-        Err(Error::Network("too many redirects".to_owned()))
+    }
+
+    /// Looks for a calendar server at a mail domain's `/.well-known/caldav` (RFC 6764) without
+    /// sending any credentials. Returns where the redirects ended, if a server there asked to
+    /// sign in or answered as WebDAV: one to offer the user, not to send the password to unasked.
+    pub async fn probe(&self, domain: &str) -> Result<Url, Error> {
+        let start = Url::parse(&format!("https://{domain}/.well-known/caldav")).map_err(|_| Error::NoServer)?;
+        let method = Method::from_bytes(b"PROPFIND").expect("a valid method");
+        let body = propfind(&["<d:current-user-principal/>"]);
+        let (url, response) = self.fetch(method, &start, Some("0"), Some(body), &[], false).await?;
+        match response.status() {
+            StatusCode::MULTI_STATUS => Ok(url),
+            StatusCode::UNAUTHORIZED if asks_for_basic(&response) => Ok(url),
+            _ => Err(Error::NoServer),
+        }
     }
 
     async fn multistatus(&self, method: &str, url: &Url, depth: &str, body: String) -> Result<(Url, String), Error> {
@@ -193,13 +298,24 @@ impl Client {
         };
         let document = roxmltree::Document::parse(&text).map_err(|_| Error::Answer)?;
         if let Some(home) = href_in(&document, CALDAV, "calendar-home-set", &base) {
-            return Ok(home);
+            return Ok(self.named_by(&base, home));
         }
         let principal = href_in(&document, DAV, "current-user-principal", &base).ok_or(Error::NoServer)?;
+        let principal = self.named_by(&base, principal);
         let body = propfind(&["<c:calendar-home-set/>"]);
         let (base, text) = self.multistatus("PROPFIND", &principal, "0", body).await?;
         let document = roxmltree::Document::parse(&text).map_err(|_| Error::Answer)?;
-        href_in(&document, CALDAV, "calendar-home-set", &base).ok_or(Error::NoServer)
+        let home = href_in(&document, CALDAV, "calendar-home-set", &base).ok_or(Error::NoServer)?;
+        Ok(self.named_by(&base, home))
+    }
+
+    /// An address a server's answer named: trusted when that server is, as iCloud names a home
+    /// on another host. The server already holds the credentials, so this tells no one new.
+    fn named_by(&self, server: &Url, named: Url) -> Url {
+        if self.trusts(server) {
+            self.trust(&named);
+        }
+        named
     }
 
     /// The event calendars in a calendar home.
@@ -338,14 +454,15 @@ pub fn parse_events(text: &str, base: &Url) -> Result<Vec<Resource>, Error> {
 /// local server only.
 pub const TEST_ROOTS_ENV: &str = "SIGNET_TEST_ROOTS";
 
-fn tls_config() -> Result<rustls::ClientConfig, Error> {
+fn tls_config(roots: Option<&Path>) -> Result<rustls::ClientConfig, Error> {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
     use rustls_platform_verifier::BuilderVerifierExt;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| Error::Network(error.to_string()))?;
-    let config = match std::env::var_os(TEST_ROOTS_ENV) {
+    let roots = roots.map(Path::to_path_buf).or_else(|| std::env::var_os(TEST_ROOTS_ENV).map(Into::into));
+    let config = match roots {
         Some(path) => {
             let mut roots = rustls::RootCertStore::empty();
             for cert in CertificateDer::pem_file_iter(path).map_err(|e| Error::Network(e.to_string()))? {
@@ -361,6 +478,29 @@ fn tls_config() -> Result<rustls::ClientConfig, Error> {
             .with_no_client_auth(),
     };
     Ok(config)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn host_of(url: &Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_owned(),
+        _ => url.to_string(),
+    }
+}
+
+/// Whether a 401 answer offers Basic authentication among its challenges.
+fn asks_for_basic(response: &reqwest::Response) -> bool {
+    response.headers().get_all(header::WWW_AUTHENTICATE).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split([',', ' ', '\t'])
+                .any(|token| token.eq_ignore_ascii_case("basic"))
+        })
+    })
 }
 
 /// An error with its causes: reqwest's own text is only "error sending request".
@@ -437,12 +577,22 @@ fn normalise_color(color: &str) -> Option<String> {
     }
 }
 
-/// Where an account's calendars may be, most likely first: the configured address, a known
-/// provider's server, or RFC 6764's well-known address at the mail domain.
-pub fn candidates(address: &str, mail_host: Option<&str>, configured: Option<&str>) -> Result<Vec<Url>, Error> {
+/// Where to look for an account's calendars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Location {
+    /// The configured address, or a known provider's server: trusted with the credentials.
+    Server(Url),
+    /// The mail domain, whose `/.well-known/caldav` may name a server ([`Client::probe`]). The
+    /// user is asked before the password goes there.
+    Domain(String),
+}
+
+/// Where an account's calendars are: the configured address, a known provider's server, or else
+/// whatever the address's domain names.
+pub fn locate(address: &str, mail_host: Option<&str>, configured: Option<&str>) -> Result<Location, Error> {
     if let Some(configured) = configured {
         return Url::parse(configured)
-            .map(|url| vec![url])
+            .map(Location::Server)
             .map_err(|_| Error::Unsupported("the caldav address in Signet's config.toml isn't a URL"));
     }
     let domain = address.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
@@ -450,7 +600,7 @@ pub fn candidates(address: &str, mail_host: Option<&str>, configured: Option<&st
     let either = |suffixes: &[&str]| {
         suffixes
             .iter()
-            .any(|s| domain == *s || domain.ends_with(&format!(".{s}")) || host.ends_with(s))
+            .any(|s| domain == *s || domain.ends_with(&format!(".{s}")) || host == *s || host.ends_with(&format!(".{s}")))
     };
     if either(&["outlook.com", "hotmail.com", "live.com", "msn.com", "office365.com"]) {
         return Err(Error::Unsupported("Outlook calendars need Microsoft Graph, which Signet doesn't support yet"));
@@ -469,27 +619,12 @@ pub fn candidates(address: &str, mail_host: Option<&str>, configured: Option<&st
         (&["yandex.ru", "yandex.com"], "https://caldav.yandex.ru/"),
     ];
     if let Some((_, url)) = known.iter().find(|(suffixes, _)| either(suffixes)) {
-        return Ok(vec![Url::parse(url).expect("a valid URL")]);
+        return Ok(Location::Server(Url::parse(url).expect("a valid URL")));
     }
-    let mut domains = vec![domain.clone()];
-    if let Some((_, parent)) = host.split_once('.')
-        && parent.contains('.')
-        && !domains.contains(&parent.to_owned())
-    {
-        domains.push(parent.to_owned());
-    }
-    let mut urls = Vec::new();
-    for domain in domains.iter().filter(|d| !d.is_empty()) {
-        for form in ["https://{}/", "https://caldav.{}/", "https://dav.{}/"] {
-            if let Ok(url) = Url::parse(&form.replace("{}", domain)) {
-                urls.push(url);
-            }
-        }
-    }
-    if urls.is_empty() {
+    if domain.is_empty() || Url::parse(&format!("https://{domain}/")).is_err() {
         return Err(Error::NoServer);
     }
-    Ok(urls)
+    Ok(Location::Domain(domain))
 }
 
 #[cfg(test)]
@@ -497,16 +632,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_providers_and_well_known_guesses() {
-        let fastmail = candidates("ada@example.com", Some("imap.fastmail.com"), None).unwrap();
-        assert_eq!(fastmail[0].as_str(), "https://caldav.fastmail.com/");
-        let icloud = candidates("ada@icloud.com", None, None).unwrap();
-        assert_eq!(icloud[0].as_str(), "https://caldav.icloud.com/");
-        let own = candidates("ada@example.org", Some("mail.example.net"), None).unwrap();
-        assert_eq!(own[0].as_str(), "https://example.org/");
-        assert!(own.iter().any(|url| url.as_str() == "https://example.net/"));
-        let set = candidates("ada@gmail.com", None, Some("https://dav.example/cal/")).unwrap();
-        assert_eq!(set[0].as_str(), "https://dav.example/cal/");
+    fn known_providers_configured_servers_and_domains() {
+        let server = |url: &str| Location::Server(Url::parse(url).unwrap());
+        let fastmail = locate("ada@example.com", Some("imap.fastmail.com"), None).unwrap();
+        assert_eq!(fastmail, server("https://caldav.fastmail.com/"));
+        assert_eq!(locate("ada@icloud.com", None, None).unwrap(), server("https://caldav.icloud.com/"));
+        let set = locate("ada@gmail.com", None, Some("https://dav.example/cal/")).unwrap();
+        assert_eq!(set, server("https://dav.example/cal/"));
+        // No guesses at the website, its subdomains or the mail server's domain: only the
+        // address's domain, to look up its well-known address without the password.
+        let own = locate("ada@Example.org", Some("mail.example.net"), None).unwrap();
+        assert_eq!(own, Location::Domain("example.org".to_owned()));
+        // A mail host merely ending in a provider's name isn't that provider.
+        let lookalike = locate("ada@example.org", Some("mail.notfastmail.com"), None).unwrap();
+        assert_eq!(lookalike, Location::Domain("example.org".to_owned()));
+        assert!(matches!(locate("nobody", None, None), Err(Error::NoServer)));
     }
 
     #[test]
@@ -557,5 +697,204 @@ END:VCALENDAR&#13;
         assert_eq!(events[0].url.as_str(), "https://dav.example/dav/cal/work/a%20b.ics");
         assert_eq!(events[0].etag.as_deref(), Some("\"e1\""));
         assert!(events[0].ics.starts_with("BEGIN:VCALENDAR"));
+    }
+
+    /// A local HTTPS server for the tests, on 127.0.0.1 with the certificate in `testdata`.
+    mod server {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        #[derive(Clone, Debug)]
+        pub struct Seen {
+            pub method: String,
+            pub path: String,
+            pub authorization: Option<String>,
+        }
+
+        pub struct Server {
+            pub url: url::Url,
+            pub seen: Arc<Mutex<Vec<Seen>>>,
+        }
+
+        impl Server {
+            pub fn seen(&self) -> Vec<Seen> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        /// Answers each request with `answer(request)`: the status line's code and reason, extra
+        /// header lines, and a body.
+        pub async fn start(answer: impl Fn(&Seen) -> (&'static str, Vec<String>, String) + Send + Sync + 'static) -> Server {
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/");
+            let certs = CertificateDer::pem_file_iter(format!("{dir}server.pem")).unwrap().map(Result::unwrap).collect();
+            let key = PrivateKeyDer::from_pem_file(format!("{dir}server.key")).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = url::Url::parse(&format!("https://127.0.0.1:{}/", listener.local_addr().unwrap().port())).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&seen);
+            let answer = Arc::new(answer);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else { return };
+                    let (acceptor, log, answer) = (acceptor.clone(), Arc::clone(&log), Arc::clone(&answer));
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        let mut stream = BufReader::new(tls);
+                        loop {
+                            let mut line = String::new();
+                            if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let mut parts = line.split_whitespace();
+                            let (method, path) = (parts.next().unwrap_or("").to_owned(), parts.next().unwrap_or("").to_owned());
+                            let (mut length, mut authorization) = (0, None);
+                            loop {
+                                let mut header = String::new();
+                                stream.read_line(&mut header).await.unwrap();
+                                let header = header.trim_end();
+                                if header.is_empty() {
+                                    break;
+                                }
+                                let (name, value) = header.split_once(':').unwrap();
+                                match name.to_ascii_lowercase().as_str() {
+                                    "content-length" => length = value.trim().parse().unwrap(),
+                                    "authorization" => authorization = Some(value.trim().to_owned()),
+                                    _ => {}
+                                }
+                            }
+                            let mut body = vec![0; length];
+                            stream.read_exact(&mut body).await.unwrap();
+                            let request = Seen { method, path, authorization };
+                            log.lock().unwrap().push(request.clone());
+                            let (status, headers, body) = answer(&request);
+                            let mut reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
+                            for header in headers {
+                                reply.push_str(&header);
+                                reply.push_str("\r\n");
+                            }
+                            reply.push_str("\r\n");
+                            reply.push_str(&body);
+                            if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Server { url, seen }
+        }
+    }
+
+    fn password_client() -> Client {
+        let roots = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/ca.pem"));
+        let credentials = Credentials::Password { username: "ada".into(), password: Zeroizing::new("secret".into()) };
+        Client::with_roots(credentials, roots).unwrap()
+    }
+
+    const HOME: &str = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>/</d:href>
+<d:propstat><d:prop><c:calendar-home-set><d:href>/cal/ada/</d:href></c:calendar-home-set></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+
+    /// A CalDAV server that asks for Basic authentication and then answers with a home.
+    fn caldav(request: &server::Seen) -> (&'static str, Vec<String>, String) {
+        match &request.authorization {
+            None => ("401 Unauthorized", vec![r#"WWW-Authenticate: Basic realm="cal""#.into()], String::new()),
+            Some(_) => ("207 Multi-Status", vec!["Content-Type: application/xml".into()], HOME.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_password_waits_for_a_basic_challenge() {
+        let server = server::start(caldav).await;
+        let client = password_client();
+        client.trust(&server.url);
+        let home = client.discover(&server.url).await.unwrap();
+        assert_eq!(home.path(), "/cal/ada/");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].authorization, None, "the first request carries no password");
+        assert_eq!(seen[1].authorization.as_deref(), Some("Basic YWRhOnNlY3JldA=="));
+        client.discover(&server.url).await.unwrap();
+        assert_eq!(server.seen().len(), 3, "once asked, the password goes along with no second challenge");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_host_gets_no_password() {
+        let elsewhere = server::start(caldav).await;
+        let target = elsewhere.url.join("/dav/").unwrap().to_string();
+        let trusted = server::start(move |request| match &request.authorization {
+            None => ("401 Unauthorized", vec![r#"WWW-Authenticate: Basic realm="cal""#.into()], String::new()),
+            Some(_) => ("301 Moved Permanently", vec![format!("Location: {target}")], String::new()),
+        })
+        .await;
+        let client = password_client();
+        client.trust(&trusted.url);
+        let result = client.discover(&trusted.url.join("/dav/").unwrap()).await;
+        assert!(matches!(result, Err(Error::Elsewhere(_))), "{result:?}");
+        assert!(trusted.seen().iter().any(|seen| seen.authorization.is_some()));
+        assert!(elsewhere.seen().iter().all(|seen| seen.authorization.is_none()), "{:?}", elsewhere.seen());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_asks_never_gets_the_password() {
+        let server = server::start(|_| ("404 Not Found", Vec::new(), String::new())).await;
+        let client = password_client();
+        client.trust(&server.url);
+        assert!(client.discover(&server.url).await.is_err());
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2, "the root, then /.well-known/caldav: {seen:?}");
+        assert!(seen.iter().all(|seen| seen.method == "PROPFIND"));
+        assert!(seen.iter().all(|seen| seen.authorization.is_none()));
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_server_gets_no_password_even_when_it_asks() {
+        let server = server::start(caldav).await;
+        let client = password_client();
+        let result = client.discover(&server.url.join("/dav/").unwrap()).await;
+        assert!(matches!(result, Err(Error::Elsewhere(_))), "{result:?}");
+        assert!(server.seen().iter().all(|seen| seen.authorization.is_none()));
+    }
+
+    #[tokio::test]
+    async fn probing_a_domain_follows_redirects_without_the_password() {
+        let calendars = server::start(caldav).await;
+        let target = calendars.url.join("/remote.php/dav/").unwrap().to_string();
+        let website = server::start(move |_| ("301 Moved Permanently", vec![format!("Location: {target}")], String::new())).await;
+        let client = password_client();
+        let domain = format!("127.0.0.1:{}", website.url.port().unwrap());
+        let found = client.probe(&domain).await.unwrap();
+        assert_eq!(found.as_str(), calendars.url.join("/remote.php/dav/").unwrap().as_str());
+        assert_eq!(website.seen()[0].path, "/.well-known/caldav");
+        assert!(website.seen().iter().chain(&calendars.seen()).all(|seen| seen.authorization.is_none()));
+        assert!(!client.trusts(&found), "found isn't trusted until the user allows it");
+
+        let nothing = server::start(|_| ("404 Not Found", Vec::new(), String::new())).await;
+        let domain = format!("127.0.0.1:{}", nothing.url.port().unwrap());
+        assert!(matches!(client.probe(&domain).await, Err(Error::NoServer)));
+    }
+
+    #[tokio::test]
+    async fn a_trusted_server_may_name_a_home_on_another_host() {
+        let other = server::start(caldav).await;
+        let named = other.url.join("/cal/ada/").unwrap().to_string();
+        let trusted = server::start(move |request| match &request.authorization {
+            None => ("401 Unauthorized", vec![r#"WWW-Authenticate: Basic realm="cal""#.into()], String::new()),
+            Some(_) => ("207 Multi-Status", Vec::new(), HOME.replace("/cal/ada/", &named)),
+        })
+        .await;
+        let client = password_client();
+        client.trust(&trusted.url);
+        let home = client.discover(&trusted.url).await.unwrap();
+        assert_eq!(home.origin(), other.url.origin());
+        assert!(client.trusts(&home), "as iCloud does: the trusted server named it");
     }
 }

@@ -30,6 +30,8 @@ Calendars are read over **CalDAV**. Signet finds the server from your address:
 | Yahoo, AOL, mailbox.org, Posteo, GMX, web.de, Zoho, Yandex | their CalDAV servers |
 | Your own domain (Nextcloud, Radicale, Baïkal, Stalwart, …) | `https://<domain>/.well-known/caldav` (RFC 6764) |
 
+The password goes only to that server. For your own domain, Signet first looks up `/.well-known/caldav` without the password. It then asks you once (“Use dav.example.com for Work’s calendars?”) before signing in to the server that answers, and remembers your answer. If no server is found, Signet doesn't look again until you click Refresh or change `config.toml`.
+
 **Gmail accounts** (gmail.com, or a Google Workspace domain on Gmail's servers) get their calendars from Google Calendar through **Sign in with Google**. Google's calendar server refuses passwords, app passwords included. The app password Sealwax uses works for mail only. Set up an OAuth client once, as below, and then click **Sign In** in Signet's banner.
 
 Not yet supported: **Microsoft accounts** (`auth = "microsoft"`). These need Microsoft Graph and calendar consent, which Sealwax's mail-only sign-in doesn't grant. Signet says so in a banner. To hide those accounts, set `enabled = false` for them (see below).

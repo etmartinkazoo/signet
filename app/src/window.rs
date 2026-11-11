@@ -10,7 +10,7 @@ use libadwaita::{self as adw, prelude::*};
 use signet_core::accounts;
 use signet_core::event::{self, Answer, Attendee, Draft, Removal, Scope};
 use signet_core::ics::{self, Component};
-use signet_core::service::{Problem, Service};
+use signet_core::service::{Approval, Problem, Service};
 use signet_core::store::Calendar;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -193,7 +193,10 @@ impl Window {
         action("previous", |this| this.go_to(this.first.get() - Duration::days(7)));
         action("next", |this| this.go_to(this.first.get() + Duration::days(7)));
         action("today", |this| this.go_to(Local::now().date_naive()));
-        action("refresh", |this| this.refresh_now(this.first.get()));
+        action("refresh", |this| {
+            this.service.retry_discovery();
+            this.refresh_now(this.first.get());
+        });
         action("new", |this| {
             let now = Local::now().naive_local();
             let day = if (this.first.get()..this.first.get() + Duration::days(7)).contains(&now.date()) {
@@ -266,10 +269,12 @@ impl Window {
         let weak = Rc::downgrade(this);
         self.banner.connect_button_clicked(move |_| {
             let Some(this) = weak.upgrade() else { return };
+            let approve = this.problems.borrow().iter().find(|p| p.approve.is_some()).cloned();
             let sign_in = this.problems.borrow().iter().find_map(|p| p.sign_in.clone());
-            match sign_in {
-                Some(key) => this.sign_in(key),
-                None => this.show_problems(),
+            match (approve, sign_in) {
+                (Some(problem), _) => this.review(problem),
+                (None, Some(key)) => this.sign_in(key),
+                (None, None) => this.show_problems(),
             }
         });
     }
@@ -504,10 +509,24 @@ impl Window {
 
     fn refreshed(&self, problems: Vec<Problem>) {
         self.set_refreshing(false);
+        let approving = problems.iter().find(|p| p.approve.is_some());
         let signing_in = problems.iter().find(|p| p.sign_in.is_some());
-        self.banner.set_button_label(Some(if signing_in.is_some() { "Sign In" } else { "Details" }));
+        self.banner.set_button_label(Some(match (approving, signing_in) {
+            (Some(_), _) => "Review",
+            (None, Some(_)) => "Sign In",
+            (None, None) => "Details",
+        }));
         match problems.as_slice() {
             [] => self.banner.set_revealed(false),
+            _ if let Some(one) = approving
+                && let Some(approval) = &one.approve =>
+            {
+                self.banner.set_title(&glib::markup_escape_text(&format!(
+                    "Use {} for {}’s calendars?",
+                    approval.host, one.account
+                )));
+                self.banner.set_revealed(true);
+            }
             _ if let Some(one) = signing_in => {
                 self.banner.set_title(&glib::markup_escape_text(&format!(
                     "Sign in with Google to see the calendars of {}",
@@ -552,6 +571,29 @@ impl Window {
                 Err(error) => error,
             };
             let _ = WidgetExt::activate_action(&window, "win.signed-in", Some(&message.to_variant()));
+        });
+    }
+
+    /// Asks whether an account's password may go to the calendar server discovery found, and
+    /// saves the answer: until then, nothing is sent there.
+    fn review(&self, problem: Problem) {
+        let Some(approval) = problem.approve.clone() else { return };
+        let alert = adw::AlertDialog::new(
+            Some(&format!("Use {} for {}’s Calendars?", approval.host, problem.account)),
+            Some(&problem.message),
+        );
+        alert.add_responses(&[("deny", "_Don’t Allow"), ("allow", "_Allow")]);
+        alert.set_close_response("later");
+        let service = Arc::clone(&self.service);
+        let window = self.window.clone();
+        glib::spawn_future_local(async move {
+            let allowed = match alert.choose_future(Some(&window)).await.as_str() {
+                "allow" => true,
+                "deny" => false,
+                _ => return,
+            };
+            let message = service.decide(&approval, allowed).err().unwrap_or_default();
+            let _ = WidgetExt::activate_action(&window, "win.decided", Some(&message.to_variant()));
         });
     }
 
@@ -850,29 +892,51 @@ fn utc(local: signet_core::Tz, day: NaiveDate) -> chrono::DateTime<Utc> {
     event::resolve(local, day.and_time(NaiveTime::MIN)).with_timezone(&Utc)
 }
 
+type ProblemTuple = (String, String, String, String, String, String);
+
 fn problems_variant(problems: &[Problem]) -> glib::Variant {
     problems
         .iter()
-        .map(|p| (p.account.clone(), p.message.clone(), p.sign_in.clone().unwrap_or_default()))
-        .collect::<Vec<(String, String, String)>>()
+        .map(|p| {
+            let approve = p.approve.clone().map(|a| (a.key, a.server, a.host)).unwrap_or_default();
+            (p.account.clone(), p.message.clone(), p.sign_in.clone().unwrap_or_default(), approve.0, approve.1, approve.2)
+        })
+        .collect::<Vec<ProblemTuple>>()
         .to_variant()
 }
 
 /// Actions that carry results from background work back to the window.
 pub fn install_result_actions(this: &Rc<Window>) {
     let weak = Rc::downgrade(this);
-    let refreshed = gio::SimpleAction::new("refreshed", Some(glib::VariantTy::new("a(sss)").expect("a type")));
+    let refreshed = gio::SimpleAction::new("refreshed", Some(glib::VariantTy::new("a(ssssss)").expect("a type")));
     refreshed.connect_activate(move |_, value| {
         let (Some(this), Some(value)) = (weak.upgrade(), value) else { return };
-        let problems: Vec<(String, String, String)> = value.get().unwrap_or_default();
+        let problems: Vec<ProblemTuple> = value.get().unwrap_or_default();
         this.refreshed(
             problems
                 .into_iter()
-                .map(|(account, message, key)| Problem { account, message, sign_in: (!key.is_empty()).then_some(key) })
+                .map(|(account, message, key, approve_key, server, host)| Problem {
+                    account,
+                    message,
+                    sign_in: (!key.is_empty()).then_some(key),
+                    approve: (!approve_key.is_empty()).then_some(Approval { key: approve_key, server, host }),
+                })
                 .collect(),
         );
     });
     this.window.add_action(&refreshed);
+
+    let weak = Rc::downgrade(this);
+    let decided = gio::SimpleAction::new("decided", Some(glib::VariantTy::STRING));
+    decided.connect_activate(move |_, value| {
+        let (Some(this), Some(value)) = (weak.upgrade(), value) else { return };
+        let message: String = value.get().unwrap_or_default();
+        if !message.is_empty() {
+            this.toast(&message);
+        }
+        this.refresh_now(this.first.get());
+    });
+    this.window.add_action(&decided);
 
     let weak = Rc::downgrade(this);
     let written = gio::SimpleAction::new("written", Some(glib::VariantTy::STRING));

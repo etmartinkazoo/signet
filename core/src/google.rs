@@ -19,7 +19,7 @@ const AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
 const CALENDAR_LIST: &str = "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&maxResults=250";
 /// Each calendar's CalDAV collection is `<root><calendar id>/events/`.
-const CALDAV_ROOT: &str = "https://apidata.googleusercontent.com/caldav/v2/";
+pub(crate) const CALDAV_ROOT: &str = "https://apidata.googleusercontent.com/caldav/v2/";
 /// Calendar access, and the signed-in address so Signet can check it's the right account.
 const SCOPES: &str = "https://www.googleapis.com/auth/calendar openid email";
 /// How long the browser has to come back.
