@@ -194,6 +194,9 @@ def publish(ver: str) -> None:
         shutil.rmtree(pages)
     shutil.copytree(SITE, pages)
     run("git", "init", "--quiet", "--initial-branch=main", cwd=pages)
+    # The site's commit is authored as the Signet repository's own commits are.
+    for key in ("user.name", "user.email"):
+        run("git", "config", key, output("git", "config", key), cwd=pages)
     run("git", "add", "--all", cwd=pages)
     run("git", "commit", "--quiet", "--message", f"Signet {ver}", cwd=pages)
     run("git", "push", "--force", PAGES_REPO, "main", cwd=pages)
