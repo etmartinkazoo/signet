@@ -15,6 +15,11 @@
   <url type="homepage">https://github.com/etmartinkazoo/signet</url>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-11-13">
+      <description>
+        <p>Google accounts use their app password, the one Sealwax signs in with, unless Sign in with Google is set up.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-13"/>
   </releases>
 </component>

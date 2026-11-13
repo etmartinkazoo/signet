@@ -162,8 +162,15 @@ impl Config {
     }
 }
 
+/// Google's CalDAV endpoint that takes a password (an app password), for Google accounts when
+/// no OAuth client is set up: the same password Sealwax signs in to Gmail with.
+fn google_password_caldav(address: &str) -> String {
+    format!("https://www.google.com/calendar/dav/{address}/user/")
+}
+
 /// Sealwax's accounts with Signet's settings applied; disabled ones are left out. A missing
-/// file is no accounts.
+/// file is no accounts. A Google account uses Sign in with Google when `[google]` is set up, and
+/// its app password over CalDAV otherwise.
 pub fn load(path: &Path, config: &Config) -> Result<Vec<Account>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -184,14 +191,19 @@ pub fn load(path: &Path, config: &Config) -> Result<Vec<Account>, String> {
                 Some("microsoft") => Auth::Microsoft,
                 _ => Auth::Password,
             };
+            let mail_host = raw.imap.or(raw.pop3).map(|server| server.host);
+            let caldav = settings.caldav.or_else(|| {
+                (config.google.is_none() && crate::google::is_google(&raw.address, mail_host.as_deref()))
+                    .then(|| google_password_caldav(&raw.address))
+            });
             Some(Account {
                 label: raw.label.unwrap_or_else(|| raw.address.clone()),
                 username: settings
                     .username
                     .or(raw.username)
                     .unwrap_or_else(|| raw.address.clone()),
-                mail_host: raw.imap.or(raw.pop3).map(|server| server.host),
-                caldav: settings.caldav,
+                mail_host,
+                caldav,
                 key: raw.key,
                 name: raw.name,
                 address: raw.address,
@@ -383,6 +395,22 @@ host = "smtp.example.org"
         let off: Config = toml::from_str("[account.old]\nenabled = false\n").unwrap();
         assert_eq!(load(&path, &off).unwrap().len(), 1);
         assert!(load(&dir.path().join("none.toml"), &off).unwrap().is_empty());
+    }
+
+    #[test]
+    fn google_uses_an_app_password_unless_oauth_is_set_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        std::fs::write(&path, "[[account]]\nkey = \"g\"\naddress = \"ada@gmail.com\"\n").unwrap();
+
+        let plain = load(&path, &Config::default()).unwrap();
+        assert!(!plain[0].is_google());
+        assert_eq!(plain[0].caldav.as_deref(), Some("https://www.google.com/calendar/dav/ada@gmail.com/user/"));
+
+        let oauth: Config = toml::from_str("[google]\nclient_id = \"id\"\nclient_secret = \"secret\"\n").unwrap();
+        let signed_in = load(&path, &oauth).unwrap();
+        assert!(signed_in[0].is_google());
+        assert_eq!(signed_in[0].caldav, None);
     }
 
     #[test]
