@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.brem.Signet</id>
+  <name>Signet</name>
+  <summary>A calendar that shares its accounts with Sealwax</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Signet is a fast, keyboard-first week calendar for CalDAV and Google Calendar. It reads the
+      accounts you set up in the Sealwax mail client, so there is nothing to configure twice.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.brem.Signet.desktop</launchable>
+  <url type="homepage">https://github.com/etmartinkazoo/signet</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-13"/>
+  </releases>
+</component>

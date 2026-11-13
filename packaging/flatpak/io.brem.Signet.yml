@@ -1,0 +1,48 @@
+# Signet as a Flatpak, the release build. tools/flatpak.py builds it from `git archive` of the
+# tagged commit and publishes it in Signet's own signed Flatpak repository, as Sealwax does. The
+# crates come from cargo-sources.json (tools/flatpak-cargo-sources.py); the build has no network.
+app-id: io.brem.Signet
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: signet
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Sealwax's account list, read-only: an unsandboxed Sealwax's, or the Sealwax flatpak's.
+  # Nothing else of Sealwax's (its keyring included) is reachable.
+  - --filesystem=xdg-config/sealwax:ro
+  - --filesystem=~/.var/app/io.github.pixdevsapps.Sealwax/config/sealwax:ro
+  # The live Omarchy theme and Hyprland's rounding, read-only, as Sealwax reads them.
+  - --filesystem=~/.local/state/omarchy:ro
+  - --filesystem=xdg-config/omarchy:ro
+  - --filesystem=xdg-config/hypr:ro
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/signet/cargo
+    CARGO_NET_OFFLINE: 'true'
+    RUSTFLAGS: --remap-path-prefix=/run/build/signet=/usr/src/signet
+modules:
+  - name: signet
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked --offline -p signet
+      - install -Dm755 target/release/signet /app/bin/signet
+      - install -Dm644 packaging/io.brem.Signet.desktop /app/share/applications/io.brem.Signet.desktop
+      - install -Dm644 packaging/io.brem.Signet.metainfo.xml /app/share/metainfo/io.brem.Signet.metainfo.xml
+      - install -Dm644 packaging/io.brem.Signet.svg /app/share/icons/hicolor/scalable/apps/io.brem.Signet.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .local
+          - .git
+          - .flatpak-builder
+      - cargo-sources.json

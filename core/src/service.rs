@@ -22,6 +22,8 @@ pub struct Problem {
     pub message: String,
     /// The account key when signing in (with Google) would fix it.
     pub sign_in: Option<String>,
+    /// The account key when entering a password in Signet would fix it.
+    pub password: Option<String>,
     /// A calendar server found for the account, which the user is asked about before the
     /// account's password goes to it.
     pub approve: Option<Approval>,
@@ -41,6 +43,7 @@ pub struct Approval {
 enum Failure {
     Message(String),
     SignIn(String),
+    Password(String),
     Approve(Url),
 }
 
@@ -133,11 +136,11 @@ impl Service {
     /// read again.
     pub async fn refresh(self: &Arc<Self>, around: DateTime<Utc>) -> Vec<Problem> {
         let mut problems = Vec::new();
-        let found = accounts::load(&accounts::sealwax_accounts_file(), &self.config);
+        let found = accounts::load(&accounts::sealwax_accounts_file(self.config.app_id()), &self.config);
         let list = match found {
             Ok(list) => list,
             Err(message) => {
-                problems.push(Problem { account: "Sealwax accounts".to_owned(), message, sign_in: None, approve: None });
+                problems.push(Problem { account: "Sealwax accounts".to_owned(), message, sign_in: None, password: None, approve: None });
                 self.accounts()
             }
         };
@@ -158,10 +161,13 @@ impl Service {
         while let Some(done) = tasks.join_next().await {
             match done {
                 Ok((account, Err(Failure::Message(message)))) => {
-                    problems.push(Problem { account: account.label, message, sign_in: None, approve: None });
+                    problems.push(Problem { account: account.label, message, sign_in: None, password: None, approve: None });
                 }
                 Ok((account, Err(Failure::SignIn(message)))) => {
-                    problems.push(Problem { account: account.label, message, sign_in: Some(account.key), approve: None });
+                    problems.push(Problem { account: account.label, message, sign_in: Some(account.key), password: None, approve: None });
+                }
+                Ok((account, Err(Failure::Password(message)))) => {
+                    problems.push(Problem { account: account.label, message, sign_in: None, password: Some(account.key), approve: None });
                 }
                 Ok((account, Err(Failure::Approve(server)))) => {
                     let host = server.host_str().unwrap_or_default().to_owned();
@@ -172,7 +178,7 @@ impl Service {
                         account.address
                     );
                     let approve = Approval { key: account.key, server: server.to_string(), host };
-                    problems.push(Problem { account: account.label, message, sign_in: None, approve: Some(approve) });
+                    problems.push(Problem { account: account.label, message, sign_in: None, password: None, approve: Some(approve) });
                 }
                 _ => {}
             }
@@ -227,7 +233,7 @@ impl Service {
             let tokens = google::Tokens::new(config, &account.key, refresh).map_err(|e| e.to_string())?;
             Credentials::Google(Arc::new(tokens))
         } else {
-            let password = accounts::sealwax_password(self.config.app_id(), &account.key)
+            let password = accounts::account_password(self.config.app_id(), &account.key)
                 .await
                 .map_err(|error| error.to_string())?;
             Credentials::Password { username: account.username.clone(), password }
@@ -300,7 +306,7 @@ impl Service {
         };
         match client.discover(&start).await {
             Ok(home) => Ok(home),
-            Err(caldav::Error::Unauthorized) => Err(unauthorized().into()),
+            Err(caldav::Error::Unauthorized) => Err(Failure::Password(unauthorized())),
             Err(error @ (caldav::Error::NotFound | caldav::Error::Status(_) | caldav::Error::Network(_))) => {
                 tracing::debug!("no CalDAV at {start}: {error}");
                 Err(not_found().into())
@@ -313,21 +319,23 @@ impl Service {
         if account.auth == Auth::Microsoft {
             return Err("Microsoft calendars aren't supported yet".to_owned().into());
         }
-        let google_sign_in = |message: String| {
+        let to_failure = |message: String| {
             if account.is_google() && message == google::Error::SignInNeeded.to_string() {
                 Failure::SignIn(message)
+            } else if !account.is_google() && message == accounts::SecretError::Missing.to_string() {
+                Failure::Password(message)
             } else {
                 Failure::Message(message)
             }
         };
-        let client = self.client(account).await.map_err(google_sign_in)?;
+        let client = self.client(account).await.map_err(to_failure)?;
         let remote = if account.is_google() {
             self.google_calendars(account, &client).await?
         } else {
             let home = self.home(account, &client).await?;
             match client.calendars(&home).await {
                 Ok(remote) => remote,
-                Err(caldav::Error::Unauthorized) => return Err(unauthorized().into()),
+                Err(caldav::Error::Unauthorized) => return Err(Failure::Password(unauthorized())),
                 Err(error) => {
                     // The home may have moved: look for it again next time.
                     let _ = self.store.set_home(&account.key, None);
@@ -402,6 +410,15 @@ impl Service {
             tracing::warn!("{error}");
         }
         Failure::SignIn(google::Error::SignInNeeded.to_string())
+    }
+
+    /// Keeps a password entered in Signet for the account and forgets its client and any failed
+    /// discovery, so the next refresh signs in with it.
+    pub async fn set_password(&self, key: &str, password: &str) -> Result<(), String> {
+        accounts::store_password(key, password).await.map_err(|error| error.to_string())?;
+        self.clients.lock().await.remove(key);
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+        Ok(())
     }
 
     /// Signs a Google account in through the browser; `open` opens the sign-in page. The
@@ -516,8 +533,8 @@ fn not_found() -> String {
 }
 
 fn unauthorized() -> String {
-    "the server didn't accept the password Sealwax has for this account (some providers need \
-     an app password for calendars too)"
+    "the server didn't accept the password for this account (some providers need an app \
+     password for calendars too)"
         .to_owned()
 }
 

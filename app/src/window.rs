@@ -271,10 +271,12 @@ impl Window {
             let Some(this) = weak.upgrade() else { return };
             let approve = this.problems.borrow().iter().find(|p| p.approve.is_some()).cloned();
             let sign_in = this.problems.borrow().iter().find_map(|p| p.sign_in.clone());
-            match (approve, sign_in) {
-                (Some(problem), _) => this.review(problem),
-                (None, Some(key)) => this.sign_in(key),
-                (None, None) => this.show_problems(),
+            let password = this.problems.borrow().iter().find(|p| p.password.is_some()).cloned();
+            match (approve, sign_in, password) {
+                (Some(problem), _, _) => this.review(problem),
+                (None, Some(key), _) => this.sign_in(key),
+                (None, None, Some(problem)) => this.ask_password(problem),
+                (None, None, None) => this.show_problems(),
             }
         });
     }
@@ -511,10 +513,12 @@ impl Window {
         self.set_refreshing(false);
         let approving = problems.iter().find(|p| p.approve.is_some());
         let signing_in = problems.iter().find(|p| p.sign_in.is_some());
-        self.banner.set_button_label(Some(match (approving, signing_in) {
-            (Some(_), _) => "Review",
-            (None, Some(_)) => "Sign In",
-            (None, None) => "Details",
+        let password = problems.iter().find(|p| p.password.is_some());
+        self.banner.set_button_label(Some(match (approving, signing_in, password) {
+            (Some(_), _, _) => "Review",
+            (None, Some(_), _) => "Sign In",
+            (None, None, Some(_)) => "Enter Password",
+            (None, None, None) => "Details",
         }));
         match problems.as_slice() {
             [] => self.banner.set_revealed(false),
@@ -530,6 +534,13 @@ impl Window {
             _ if let Some(one) = signing_in => {
                 self.banner.set_title(&glib::markup_escape_text(&format!(
                     "Sign in with Google to see the calendars of {}",
+                    one.account
+                )));
+                self.banner.set_revealed(true);
+            }
+            _ if let Some(one) = password => {
+                self.banner.set_title(&glib::markup_escape_text(&format!(
+                    "Enter the calendar password for {}",
                     one.account
                 )));
                 self.banner.set_revealed(true);
@@ -594,6 +605,48 @@ impl Window {
             };
             let message = service.decide(&approval, allowed).err().unwrap_or_default();
             let _ = WidgetExt::activate_action(&window, "win.decided", Some(&message.to_variant()));
+        });
+    }
+
+    /// Asks for the account's calendar password and keeps it under Signet's name: for a
+    /// provider that wants an app password, or a Sealwax whose keyring Signet can't read.
+    fn ask_password(&self, problem: Problem) {
+        let Some(key) = problem.password.clone() else { return };
+        let alert = adw::AlertDialog::new(
+            Some(&format!("Calendar Password for {}", problem.account)),
+            Some(&format!(
+                "{}.\n\nSignet keeps this password in the keyring under its own name. Sealwax’s is \
+                 left as it is.",
+                capitalize(&problem.message)
+            )),
+        );
+        let entry = gtk::PasswordEntry::builder().show_peek_icon(true).activates_default(true).build();
+        alert.set_extra_child(Some(&entry));
+        alert.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
+        alert.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        alert.set_default_response(Some("save"));
+        alert.set_close_response("cancel");
+        alert.set_response_enabled("save", false);
+        let weak_alert = alert.downgrade();
+        entry.connect_changed(move |entry| {
+            if let Some(alert) = weak_alert.upgrade() {
+                alert.set_response_enabled("save", !entry.text().is_empty());
+            }
+        });
+        let service = Arc::clone(&self.service);
+        let window = self.window.clone();
+        glib::spawn_future_local(async move {
+            if alert.choose_future(Some(&window)).await != "save" {
+                return;
+            }
+            let password = entry.text().to_string();
+            entry.set_text("");
+            let result = run(async move { service.set_password(&key, &password).await }).await;
+            let message = match result {
+                Ok(()) => "Password saved".to_owned(),
+                Err(error) => error,
+            };
+            let _ = WidgetExt::activate_action(&window, "win.signed-in", Some(&message.to_variant()));
         });
     }
 
@@ -892,14 +945,27 @@ fn utc(local: signet_core::Tz, day: NaiveDate) -> chrono::DateTime<Utc> {
     event::resolve(local, day.and_time(NaiveTime::MIN)).with_timezone(&Utc)
 }
 
-type ProblemTuple = (String, String, String, String, String, String);
+type ProblemTuple = (String, String, String, String, String, String, String);
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
 
 fn problems_variant(problems: &[Problem]) -> glib::Variant {
     problems
         .iter()
         .map(|p| {
             let approve = p.approve.clone().map(|a| (a.key, a.server, a.host)).unwrap_or_default();
-            (p.account.clone(), p.message.clone(), p.sign_in.clone().unwrap_or_default(), approve.0, approve.1, approve.2)
+            (
+                p.account.clone(),
+                p.message.clone(),
+                p.sign_in.clone().unwrap_or_default(),
+                p.password.clone().unwrap_or_default(),
+                approve.0,
+                approve.1,
+                approve.2,
+            )
         })
         .collect::<Vec<ProblemTuple>>()
         .to_variant()
@@ -908,17 +974,18 @@ fn problems_variant(problems: &[Problem]) -> glib::Variant {
 /// Actions that carry results from background work back to the window.
 pub fn install_result_actions(this: &Rc<Window>) {
     let weak = Rc::downgrade(this);
-    let refreshed = gio::SimpleAction::new("refreshed", Some(glib::VariantTy::new("a(ssssss)").expect("a type")));
+    let refreshed = gio::SimpleAction::new("refreshed", Some(glib::VariantTy::new("a(sssssss)").expect("a type")));
     refreshed.connect_activate(move |_, value| {
         let (Some(this), Some(value)) = (weak.upgrade(), value) else { return };
         let problems: Vec<ProblemTuple> = value.get().unwrap_or_default();
         this.refreshed(
             problems
                 .into_iter()
-                .map(|(account, message, key, approve_key, server, host)| Problem {
+                .map(|(account, message, key, password, approve_key, server, host)| Problem {
                     account,
                     message,
                     sign_in: (!key.is_empty()).then_some(key),
+                    password: (!password.is_empty()).then_some(password),
                     approve: (!approve_key.is_empty()).then_some(Approval { key: approve_key, server, host }),
                 })
                 .collect(),

@@ -162,12 +162,19 @@ pub fn parse_hex(text: &str) -> Option<Rgb> {
     Some((channel(0..2)?, channel(2..4)?, channel(4..6)?))
 }
 
-fn omarchy_dir() -> PathBuf {
-    let state = match std::env::var_os("XDG_STATE_HOME").map(PathBuf::from) {
+/// The host's XDG base dir: in a flatpak, `XDG_*_HOME` point into the sandbox, and the
+/// host's own values (if it set any) come as `HOST_XDG_*_HOME`.
+fn host_dir(variable: &str, fallback: &str) -> PathBuf {
+    let sandboxed = std::path::Path::new("/.flatpak-info").exists();
+    let name = if sandboxed { format!("HOST_{variable}") } else { variable.to_owned() };
+    match std::env::var_os(name).map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
-        _ => std::env::home_dir().unwrap_or_default().join(".local/state"),
-    };
-    state.join("omarchy/current")
+        _ => std::env::home_dir().unwrap_or_default().join(fallback),
+    }
+}
+
+fn omarchy_dir() -> PathBuf {
+    host_dir("XDG_STATE_HOME", ".local/state").join("omarchy/current")
 }
 
 /// `key = "value"` lines, leniently, as `omarchy-theme-color` reads them.
@@ -248,11 +255,7 @@ pub fn follow(changed: impl Fn(Palette) + 'static) -> Palette {
     let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
     // `omarchy-theme-set` replaces the `current/theme` directory and rewrites `theme.name`;
     // Hyprland reloads its config, rounding included, when a file in `~/.config/hypr` changes.
-    let hypr = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => dir,
-        _ => std::env::home_dir().unwrap_or_default().join(".config"),
-    }
-    .join("hypr");
+    let hypr = host_dir("XDG_CONFIG_HOME", ".config").join("hypr");
     let watched = [
         gio::File::for_path(omarchy_dir().join("theme.name")).monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE),
         gio::File::for_path(hypr).monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE),

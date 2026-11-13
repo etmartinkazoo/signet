@@ -2,6 +2,10 @@
 //! and each account's password from the item Sealwax keeps in the keyring, so an account set up
 //! once in Sealwax has its calendars here too. Signet's own `config.toml` adds what Sealwax has no
 //! reason to know: a CalDAV address when discovery can't find one, or an account to leave out.
+//!
+//! A password can also be entered in Signet itself: an app password a provider wants for
+//! calendars, or any password when Sealwax runs as a flatpak, whose keyring no other app can
+//! read. Signet keeps those under its own name and uses them first.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -18,8 +22,22 @@ fn base_dir(variable: &str, fallback: &str) -> PathBuf {
     }
 }
 
-pub fn sealwax_accounts_file() -> PathBuf {
-    base_dir("XDG_CONFIG_HOME", ".config").join("sealwax/accounts.toml")
+/// Where Sealwax keeps `accounts.toml`, the first that exists of: the config dir Signet sees
+/// (both unsandboxed), the host's `~/.config` (Signet a flatpak, Sealwax not), and the Sealwax
+/// flatpak's own config dir. The first is returned when none exists yet.
+pub fn sealwax_accounts_file(app_id: &str) -> PathBuf {
+    let home = std::env::home_dir().unwrap_or_default();
+    let mut candidates = vec![
+        base_dir("XDG_CONFIG_HOME", ".config").join("sealwax/accounts.toml"),
+        home.join(".config/sealwax/accounts.toml"),
+    ];
+    // The app-id comes from config.toml: only a plain reverse-DNS name may become a path.
+    if !app_id.is_empty() && app_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !app_id.starts_with('.')
+    {
+        candidates.push(home.join(".var/app").join(app_id).join("config/sealwax/accounts.toml"));
+    }
+    candidates.iter().find(|path| path.exists()).cloned().unwrap_or_else(|| candidates.swap_remove(0))
 }
 
 pub fn signet_config_file() -> PathBuf {
@@ -222,7 +240,7 @@ fn oklch_to_rgb(lightness: f64, chroma: f64, hue: f64) -> (f64, f64, f64) {
 pub enum SecretError {
     #[error("the keyring is locked")]
     Locked,
-    #[error("Sealwax has no password for this account in the keyring")]
+    #[error("there's no password for this account in the keyring")]
     Missing,
     #[error("keyring: {0}")]
     Keyring(String),
@@ -231,6 +249,7 @@ pub enum SecretError {
 /// The app-id Signet's own keyring items are kept under, in debug and release builds alike.
 pub const SIGNET_APP_ID: &str = "io.brem.Signet";
 const GOOGLE_TOKEN: &str = "google-refresh-token";
+const PASSWORD: &str = "password";
 
 async fn keyring() -> Result<oo7::Keyring, SecretError> {
     let keyring = tokio::time::timeout(std::time::Duration::from_secs(5), oo7::Keyring::new())
@@ -267,22 +286,47 @@ pub async fn forget_google_token(account: &str) -> Result<(), SecretError> {
     keyring().await?.delete(&attributes).await.map_err(|e| SecretError::Keyring(e.to_string()))
 }
 
-/// The password Sealwax keeps for `account`: the Secret Service item with Sealwax's attributes.
-pub async fn sealwax_password(app_id: &str, account: &str) -> Result<Zeroizing<String>, SecretError> {
+/// The password for `account`: the one entered in Signet if there is one, else Sealwax's.
+pub async fn account_password(sealwax_app_id: &str, account: &str) -> Result<Zeroizing<String>, SecretError> {
     let keyring = keyring().await?;
-    let attributes = [("application", app_id), ("account", account), ("kind", "password")];
+    for app_id in [SIGNET_APP_ID, sealwax_app_id] {
+        if let Some(password) = find_password(&keyring, app_id, account).await? {
+            return Ok(password);
+        }
+    }
+    Err(SecretError::Missing)
+}
+
+/// The Secret Service item `app_id` keeps for `account`'s password, if any.
+async fn find_password(
+    keyring: &oo7::Keyring,
+    app_id: &str,
+    account: &str,
+) -> Result<Option<Zeroizing<String>>, SecretError> {
+    let attributes = [("application", app_id), ("account", account), ("kind", PASSWORD)];
     let items = keyring
         .search_items(&attributes)
         .await
         .map_err(|error| SecretError::Keyring(error.to_string()))?;
-    let item = items.first().ok_or(SecretError::Missing)?;
+    let Some(item) = items.first() else { return Ok(None) };
     let secret = item
         .secret()
         .await
         .map_err(|error| SecretError::Keyring(error.to_string()))?;
     let text = String::from_utf8(secret.as_bytes().to_vec())
         .map_err(|_| SecretError::Keyring("the password isn't text".to_owned()))?;
-    Ok(Zeroizing::new(text))
+    Ok(Some(Zeroizing::new(text)))
+}
+
+/// Keeps a password entered in Signet for `account`, replacing one entered before. Sealwax's
+/// item is never touched.
+pub async fn store_password(account: &str, password: &str) -> Result<(), SecretError> {
+    let attributes = [("application", SIGNET_APP_ID), ("account", account), ("kind", PASSWORD)];
+    keyring()
+        .await?
+        .create_item(&format!("Signet: calendar password ({account})"), &attributes, oo7::Secret::text(password), true)
+        .await
+        .map_err(|e| SecretError::Keyring(e.to_string()))
 }
 
 #[cfg(test)]
@@ -339,6 +383,13 @@ host = "smtp.example.org"
         let off: Config = toml::from_str("[account.old]\nenabled = false\n").unwrap();
         assert_eq!(load(&path, &off).unwrap().len(), 1);
         assert!(load(&dir.path().join("none.toml"), &off).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_plain_app_id_becomes_a_path() {
+        for bad in ["", "../..", "a/b", ".hidden"] {
+            assert!(!sealwax_accounts_file(bad).to_string_lossy().contains(".var/app"), "{bad}");
+        }
     }
 
     #[test]

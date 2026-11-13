@@ -57,6 +57,14 @@ Google requires each app to have its own OAuth client. Making one is free and ta
 
 Signet asks only for calendar access, plus your address, which it checks against the Sealwax account. The refresh token Google returns is kept in the keyring under Signet's own name (`application=io.brem.Signet`, `kind=google-refresh-token`), never in Sealwax's items. Google says a desktop client's secret can't be kept secret in an installed app, so it lives in `config.toml`. To sign out, revoke Signet's access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). Signet then offers to sign in again.
 
+## Passwords
+
+For other accounts Signet uses the password Sealwax keeps in the keyring. When it can't (Sealwax
+installed as a Flatpak, whose keyring no other app can read) or the server refuses it (some
+providers want an app password for calendars), the banner offers **Enter Password**. Signet keeps
+that password under its own name (`application=io.brem.Signet`, `kind=password`), uses it before
+Sealwax's from then on, and never changes Sealwax's.
+
 ## Settings
 
 `~/.config/signet/config.toml` is optional:
@@ -99,7 +107,32 @@ Needs Rust 1.92+, GTK 4.18+, libadwaita 1.9+, SQLite and a Secret Service such a
 cargo build --release
 install -Dm755 target/release/signet ~/.local/bin/signet
 install -Dm644 packaging/io.brem.Signet.desktop ~/.local/share/applications/io.brem.Signet.desktop
+install -Dm644 packaging/io.brem.Signet.svg ~/.local/share/icons/hicolor/scalable/apps/io.brem.Signet.svg
 ```
+
+### Flatpak
+
+`packaging/flatpak/io.brem.Signet.yml` builds Signet on the GNOME 51 runtime with no network:
+every crate is listed in `cargo-sources.json`, checked against `Cargo.lock`. Regenerate that file
+whenever `Cargo.lock` changes: `tools/flatpak-cargo-sources.py`.
+
+The sandbox can read Sealwax's account list (`~/.config/sealwax`, or the Sealwax Flatpak's
+`~/.var/app/io.github.pixdevsapps.Sealwax/config/sealwax`) and the Omarchy theme, all read-only,
+and nothing else of the home folder. Its keyring is its own, so mail-server passwords are entered
+once in Signet (see [Passwords](#passwords)). Opening an invitation from Sealwax in Signet needs
+both apps outside a sandbox.
+
+Releases go out the way Sealwax's do, from `tools/flatpak.py` (it explains each step):
+
+```sh
+python3 tools/flatpak.py keygen      # once: the repository's signing key, in .local/flatpak/gpg
+git tag v0.1.0 && python3 tools/flatpak.py build
+SIGNET_FLATPAK_URL=https://etmartinkazoo.github.io/signet-flatpak/ python3 tools/flatpak.py site
+python3 tools/flatpak.py publish     # pushes the signed repository to signet-flatpak's Pages
+```
+
+Then attach `.local/flatpak/site/io.brem.Signet.flatpakref` to the GitHub release, and install with
+`flatpak install --user https://github.com/etmartinkazoo/signet/releases/latest/download/io.brem.Signet.flatpakref`.
 
 Debug builds use the app-id `io.brem.Signet.Devel`, so they run beside an installed build. Signet's own files are in `~/.local/share/signet/signet.db` (the offline copy, safe to delete) and `~/.config/signet/config.toml`. Set `SIGNET_LOG=debug` to see what it does. Logs never include passwords or event contents.
 
